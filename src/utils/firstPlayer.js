@@ -1,28 +1,26 @@
-export const findBiggerPiece = (obj) => {
-	let bigSomeEachPair = [];
-	let bigAllWithSome = [];
+export const orderPlayers = (obj) => {
+	let playersWithMaxPiece = [];
 
 	for (const player of obj.players) {
-		let all = 0;
-		let temporallyPlayer = {};
-		player.pieces.reduce((acc, value) => {
-			if (value[0] + value[1] > all) {
-				all = value[0] + value[1];
-				temporallyPlayer = { val: all, getPlayer: player };
-				return value[0] + value[1];
-			}
-			return acc;
+		const maxPiece = player.pieces.reduce((max, value) => {
+			const sum = value[0] + value[1];
+			return sum > max ? sum : max;
 		}, 0);
 
-		bigSomeEachPair.push(all);
-		bigAllWithSome.push(temporallyPlayer);
-		all = 0;
+		playersWithMaxPiece.push({ player, maxPiece });
 	}
-	return bigAllWithSome
-		.sort((player, _, idx) => player.val === bigSomeEachPair[idx])
-		.reverse()
-		.map((player) => player.getPlayer.id);
+
+	const sortedPlayers = playersWithMaxPiece
+		.sort((a, b) => b.maxPiece - a.maxPiece)
+		.map((item) => item.player.id);
+
+	return sortedPlayers;
 };
+
+
+export const getPlayer = (room, playerID) => {
+	return room.players.find((player) => player.id === playerID)
+}
 
 export const findBigSomeWithAllpieces = (obj) => {
 	let playerWithBiggerSome = null;
