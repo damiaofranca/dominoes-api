@@ -1,15 +1,17 @@
-import { createServer } from "http";
+import cors from "cors";
+import express from "express";
 import { Server } from "socket.io";
+import { createServer } from "http";
 
-import { getPiecesToUser, shuffleArray, whoIsTheWinner, isGameBlocked, askForPiece } from "../utils/getPieces.js";
 import { orderPlayers, getPlayer } from "../utils/firstPlayer.js";
+import { getPiecesToUser, shuffleArray, whoIsTheWinner, isGameBlocked, askForPiece } from "../utils/getPieces.js";
 
-const httpServer = createServer();
-const io = new Server(httpServer, {
-	cors: {
-		origin: "http://localhost:5173",
-	},
-});
+
+const app = express();
+const server = createServer(app);
+const io = new Server(server);
+
+app.use(cors());
 
 const rooms = {}
 
@@ -234,10 +236,6 @@ io.sockets.on("connection", (socket) => {
 		cb(handleraskForPiece(roomID, id));
 
 	});
-});
-
-httpServer.listen(3001, () => {
-	console.log("Running in 3001 port");
 });
 
 export default io;
