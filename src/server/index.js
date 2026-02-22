@@ -1,16 +1,41 @@
 import cors from "cors";
 import express from "express";
-import { Server } from "socket.io";
 import { createServer } from "http";
 import { RoomGame } from "../game/RoomGame.js";
+import { WebSocketServer } from "ws";
 
 const app = express();
 const server = createServer(app);
-const io = new Server(server, {
-	cors: { origin: "*" },
-});
+
+// using ws directly; the server already handles CORS via http layer
+const wss = new WebSocketServer({ server });
+
+// keep a mapping from generated socket ids to ws instances
+const clients = new Map();
+
+// simple id generator for new connections
+function generateId() {
+	return Math.random().toString(36).substring(2, 10);
+}
+
+// helper to send an event-style message over a ws
+function send(ws, event, data) {
+	if (ws.readyState === ws.OPEN) {
+		ws.send(JSON.stringify({ event, data }));
+	}
+}
+
+// send to a specific client by id
+function sendTo(id, event, data) {
+	const ws = clients.get(id);
+	if (ws && ws.readyState === ws.OPEN) {
+		send(ws, event, data);
+	}
+}
 
 app.use(cors());
+
+// parsed rooms remain the same
 
 /** @type {Record<string, RoomGame>} */
 const rooms = {};
@@ -19,68 +44,58 @@ function getRoom(roomId) {
 	return rooms[roomId] || null;
 }
 
-function createRoom(socket, { room, maxPlayers, drawRule, maxDrawsPerTurn }) {
+function createRoom(ws, { room, maxPlayers, drawRule, maxDrawsPerTurn }) {
 	const validation = RoomGame.validateMaxPlayers(maxPlayers ?? 2);
 	if (!validation.ok) {
-		socket.emit("createFailed", {
+		send(ws, "createFailed", {
 			reason: validation.reason,
 			min: validation.min,
 			max: validation.max,
 		});
 		return;
 	}
-	socket.join(room);
+	// no socket.join with ws; membership is tracked by RoomGame
 	rooms[room] = new RoomGame(room, validation.maxPlayers, {
 		drawRule,
 		maxDrawsPerTurn,
 	});
-	socket.emit("created", room);
+	send(ws, "created", room);
 }
 
 function totalPiecesSummary(roomGame, excludeSocketId) {
 	return roomGame.getPlayersSummary(excludeSocketId);
 }
 
-function emitToRoom(roomId, event, ...args) {
-	io.to(roomId).emit(event, ...args);
-}
-
-function emitToRoomExcept(roomId, excludeSocketId, event, ...args) {
-	io.to(roomId)
-		.except(excludeSocketId)
-		.emit(event, ...args);
-}
-
-function enterRoom(socket, { room, name }, cb) {
+function enterRoom(ws, { room, name }) {
 	const roomGame = getRoom(room);
 	if (!roomGame) {
-		socket.emit("DontExist");
+		send(ws, "DontExist");
 		return;
 	}
 	if ((roomGame?.game?.players ?? []).length + 1 > roomGame.maxPlayers) {
-		socket.emit("full");
+		send(ws, "full");
 		return;
 	}
-	const result = roomGame.addPlayer(socket.id, name);
+	const result = roomGame.addPlayer(ws.id, name);
 	if (!result.ok) {
 		if (result.reason === "full" || result.reason === "game_started") {
-			socket.emit("full");
+			send(ws, "full");
 		}
 		return;
 	}
-	socket.join(room);
-	// remaining: 0 = sala cheia / jogo iniciado; >0 = vagas restantes (mostrar "aguardando jogadores")
+	// compute remaining slots
 	const remaining = roomGame.isStarted()
 		? 0
 		: roomGame.maxPlayers - roomGame.players.length;
-	cb(remaining);
+	// reply to requester
+	send(ws, "enterResult", remaining);
 	if (result.started) {
 		const playerList = roomGame.players;
 		playerList.forEach(({ id: playerSocketId }, idx) => {
 			const isFirst = idx === 0;
 			const hand = roomGame.getHand(playerSocketId) ?? [];
 			const playerInfo = playerList.find((p) => p.id === playerSocketId);
-			io.to(playerSocketId).emit("ready", {
+			sendTo(playerSocketId, "ready", {
 				id: playerSocketId,
 				name: playerInfo?.name,
 				pieces: hand,
@@ -91,16 +106,16 @@ function enterRoom(socket, { room, name }, cb) {
 	}
 }
 
-function makeMove(socket, roomID, playerID, move, direction) {
+function makeMove(ws, roomID, playerID, move, direction) {
 	const roomGame = getRoom(roomID);
 	if (!roomGame) {
-		socket.emit("playerNotFound", "Sala não encontrada.");
+		send(ws, "playerNotFound", "Sala não encontrada.");
 		return;
 	}
 
 	const result = roomGame.makeMove(playerID, move, direction);
 	if (!result.ok) {
-		if (result.reason === "invalid_move") socket.emit("invalidMove");
+		if (result.reason === "invalid_move") send(ws, "invalidMove");
 		return;
 	}
 
@@ -110,7 +125,7 @@ function makeMove(socket, roomID, playerID, move, direction) {
 
 	const playerList = roomGame.players;
 	playerList.forEach(({ id }) => {
-		io.to(id).emit("newMove", {
+		sendTo(id, "newMove", {
 			players: totalPiecesSummary(roomGame, id),
 			move,
 			direction,
@@ -118,7 +133,7 @@ function makeMove(socket, roomID, playerID, move, direction) {
 			boardTiles,
 		});
 		if (nextId && id === nextId) {
-			io.to(id).emit("nextPlayer");
+			sendTo(id, "nextPlayer");
 		}
 	});
 
@@ -132,7 +147,7 @@ function makeMove(socket, roomID, playerID, move, direction) {
 				: winner
 					? `O jogador ${winner.name} bateu.`
 					: "Jogo fechado - decidido por pontos.";
-			io.to(id).emit("winner", message);
+			sendTo(id, "winner", message);
 		});
 	}
 }
@@ -162,7 +177,8 @@ function handlePlayerDisconnect({ roomID, playerID }) {
 	if (idx === -1) return null;
 	const playerList = roomGame.players;
 	playerList.forEach(({ id }) => {
-		io.to(id).emit(
+		sendTo(
+			id,
 			"gameCancelled",
 			"O jogo foi cancelado pois um jogador saiu da partida.",
 		);
@@ -201,13 +217,13 @@ function handlerAskForPiece(roomID, playerID) {
 	const nextId = result.nextPlayerId ?? roomGame.getCurrentPlayerId();
 	const playerList = roomGame.players;
 	playerList.forEach(({ id }) => {
-		io.to(id).emit("playerDrewPiece", {
+		sendTo(id, "playerDrewPiece", {
 			playerID,
 			players: totalPiecesSummary(roomGame, id),
 			passedTurn: result.passedTurn ?? false,
 		});
-		if (id === playerID) io.to(id).emit("updateHand", hand);
-		if (nextId && id === nextId) io.to(id).emit("nextPlayer");
+		if (id === playerID) sendTo(id, "updateHand", hand);
+		if (nextId && id === nextId) sendTo(id, "nextPlayer");
 	});
 	if (result.passedTurn && roomGame.isOver()) {
 		const winner = roomGame.getWinner();
@@ -218,39 +234,59 @@ function handlerAskForPiece(roomID, playerID) {
 				: winner
 					? `O jogador ${winner.name} bateu.`
 					: "Jogo fechado - decidido por pontos.";
-			io.to(id).emit("winner", message);
+			sendTo(id, "winner", message);
 		});
 	}
 
 	return { ok: true, piece: result.tile };
 }
 
-io.sockets.on("connection", (socket) => {
-	socket.on("create", ({ room, maxPlayers }) =>
-		createRoom(socket, { room, maxPlayers }),
-	);
+// convert socket.io-style events into a message dispatcher
+wss.on("connection", (ws) => {
+	// assign a simple id and keep track of the connection
+	ws.id = generateId();
+	clients.set(ws.id, ws);
 
-	socket.on("enter", ({ room, name }, cb) =>
-		enterRoom(socket, { room, name }, cb),
-	);
-
-	socket.on("verifyRoom", ({ room, user }, cb) => {
-		cb(isValidRoom(room, user, socket));
+	ws.on("close", () => {
+		clients.delete(ws.id);
 	});
 
-	socket.on("disconnect-user", ({ roomID, playerID }) => {
-		const result = handlePlayerDisconnect({ roomID, playerID });
-		if (result) socket.emit(result);
-	});
+	ws.on("message", (raw) => {
+		let msg;
+		try {
+			msg = JSON.parse(raw.toString());
+		} catch (e) {
+			console.warn("received non-json message", raw);
+			return;
+		}
+		const { event, data } = msg;
 
-	socket.on("makeMove", ({ roomID, id, move, direction }) => {
-		makeMove(socket, roomID, id, move, direction);
-	});
+		const handlers = {
+			create: (d) => createRoom(ws, d),
+			enter: (d) => enterRoom(ws, d),
+			verifyRoom: (d) => {
+				const ok = isValidRoom(d.room, d.user);
+				send(ws, "verifyRoomResult", ok);
+			},
+			"disconnect-user": (d) => {
+				const result = handlePlayerDisconnect(d);
+				if (result) send(ws, result);
+			},
+			makeMove: (d) => makeMove(ws, d.roomID, d.id, d.move, d.direction),
+			askForPiece: (d) => {
+				const result = handlerAskForPiece(d.roomID, d.id);
+				if (result?.ok) send(ws, "askForPieceResult", result.piece ?? result);
+				else
+					send(
+						ws,
+						"askForPieceError",
+						result?.message ?? "Erro ao pedir peça.",
+					);
+			},
+		};
 
-	socket.on("askForPiece", ({ roomID, id }, cb) => {
-		const result = handlerAskForPiece(roomID, id);
-		if (result?.ok) cb(result.piece ?? result);
-		else cb(result?.message ?? "Erro ao pedir peça.");
+		const handler = handlers[event];
+		if (handler) handler(data);
 	});
 });
 
@@ -258,4 +294,4 @@ server.listen(process.env.PORT || 5001, () =>
 	console.log("Server has started."),
 );
 
-export default io;
+export default wss;
