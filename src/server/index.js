@@ -2,246 +2,260 @@ import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
 import { createServer } from "http";
-
-import { orderPlayers, getPlayer } from "../utils/firstPlayer.js";
-import { getPiecesToUser, shuffleArray, whoIsTheWinner, isGameBlocked, askForPiece } from "../utils/getPieces.js";
-
+import { RoomGame } from "../game/RoomGame.js";
 
 const app = express();
 const server = createServer(app);
 const io = new Server(server, {
-	cors: {
-		origin: '*',
-	}
+	cors: { origin: "*" },
 });
 
 app.use(cors());
 
-const rooms = {}
+/** @type {Record<string, RoomGame>} */
+const rooms = {};
 
-const createRoom = (socket, { room, maxPlayers }) => {
+function getRoom(roomId) {
+	return rooms[roomId] || null;
+}
+
+function createRoom(socket, { room, maxPlayers, drawRule, maxDrawsPerTurn }) {
+	const validation = RoomGame.validateMaxPlayers(maxPlayers ?? 2);
+	if (!validation.ok) {
+		socket.emit("createFailed", {
+			reason: validation.reason,
+			min: validation.min,
+			max: validation.max,
+		});
+		return;
+	}
 	socket.join(room);
-
-	rooms[room] = {
-		room,
-		moves: [],
-		maxPlayers,
-		players: [],
-		order: null,
-		remaining: 28,
-	};
-
+	rooms[room] = new RoomGame(room, validation.maxPlayers, {
+		drawRule,
+		maxDrawsPerTurn,
+	});
 	socket.emit("created", room);
-};
-
-const makeMove = (socket, roomID, playerID, move, direction) => {
-	const playerIndex = rooms[roomID].players.findIndex(player => player.id === playerID);
-
-	if (playerIndex !== -1) {
-
-		if (rooms[roomID].moves.length === 0) {
-			const filter = filterPiece(rooms[roomID].players[playerIndex].pieces, move)
-			rooms[roomID].players[playerIndex].pieces = filter
-			rooms[roomID].moves.push(move)
-			rooms[roomID].players.forEach((_player, idx) => {
-				if (playerID === _player.id) {
-					io.to(_player.id).emit("updateHand", move);
-
-				} else if (nextPlayer(rooms[roomID].players, playerIndex) === idx) {
-					io.to(_player.id).emit("nextPlayer");
-				}
-				io.to(_player.id).emit("newMove", { players: totalPieces(rooms[roomID].players, playerID), move, direction, whoPlayed: playerID });
-
-			});
-			return () => { }
-		} else {
-			if (isValidMove(rooms[roomID].moves, move, direction)) {
-				if (!isGameBlocked(rooms[roomID].moves)) {
-					if (direction === "top") {
-						rooms[roomID].moves = ordernationFn([move, ...rooms[roomID].moves])
-					} else {
-						rooms[roomID].moves = ordernationFn([...rooms[roomID].moves, move])
-					}
-					const filter = filterPiece(rooms[roomID].players[playerIndex].pieces, move)
-					if (filter.length === 0) {
-						const winner = whoIsTheWinner(rooms[roomID].players)
-						rooms[roomID].players.forEach((_player) => {
-							io.to(_player.id).emit("winner", playerID === _player.id ? "Parabéns, você ganhou." : `O jogador: ${winner.name} bateu.`);
-						})
-					}
-					rooms[roomID].players[playerIndex].pieces = filter
-					rooms[roomID].players.forEach((_player, idx) => {
-						if (nextPlayer(rooms[roomID].players, playerIndex) === idx) {
-							io.to(_player.id).emit("nextPlayer");
-						}
-						io.to(_player.id).emit("newMove", { players: totalPieces(rooms[roomID].players, playerID), move, direction, whoPlayed: playerID });
-					});
-				} else {
-					const winner = whoIsTheWinner(rooms[roomID].players)
-					rooms[roomID].players.forEach((_player) => {
-						io.to(_player.id).emit("winner", winner.id === _player.id ? "Parabéns, você ganhou por menos pontos em mãos." : `O jogo fechou e foi decidido por pontos, o ganhador foi: ${winner.name}`);
-					})
-				}
-			} else {
-				socket.emit("invalidMove");
-			}
-		}
-
-	} else {
-		socket.emit("playerNotFound", "Jogador não encontrado.");
-	}
-};
-
-function filterPiece(pieces, target) {
-	return pieces.filter(
-		(e) =>
-			!(e[0] === target[0] && e[1] === target[1]) &&
-			!(e[0] === target[1] && e[1] === target[0]),
-	);
 }
 
-const totalPieces = (players, current) => {
-	return players.map((player) => ({ id: player.id, total: player.pieces.length })).filter((player) => player.id !== current)
+function totalPiecesSummary(roomGame, excludeSocketId) {
+	return roomGame.getPlayersSummary(excludeSocketId);
 }
 
-const nextPlayer = (players, currentIdx) => {
-	return (players.length - 1) === currentIdx ? 0 : currentIdx + 1;
+function emitToRoom(roomId, event, ...args) {
+	io.to(roomId).emit(event, ...args);
 }
 
-const ordernationFn = (t) => {
-	for (let index = 0; index < t.length; index++) {
-		if (index !== (t.length - 1)) {
-			const element = t[index];
-			const next = t[index + 1];
-			if ((element[1] !== next[0])) {
-				t[index] = element.reverse()
-			}
-		} else {
-			if (t[index - 1][1] !== t[index][0]) {
-				t[index] = t[index].reverse()
-			}
-		}
-
-	}
-	return t
+function emitToRoomExcept(roomId, excludeSocketId, event, ...args) {
+	io.to(roomId)
+		.except(excludeSocketId)
+		.emit(event, ...args);
 }
 
-
-const isValidMove = (arr, move, direction) => {
-	return (move[0] === arr[direction === "top" ? 0 : (arr.length - 1)][direction === "top" ? 0 : 1]) || (move[1] === arr[direction === "top" ? 0 : (arr.length - 1)][direction === "top" ? 0 : 1]) ? true : false
-}
-
-const isValidRoom = (room, user) => {
-
-	if (user && rooms[room]) {
-		const isValidUser = rooms[room].players.findIndex((e) => e.id === user)
-
-
-		if (isValidUser !== -1) {
-			return true;
-		}
-		return {}
-	}
-
-	return !!rooms[room]
-}
-
-const enterRoom = (socket, { room, name }, cb) => {
-
-	if (!rooms[room]) {
+function enterRoom(socket, { room, name }, cb) {
+	const roomGame = getRoom(room);
+	if (!roomGame) {
 		socket.emit("DontExist");
 		return;
 	}
-
-	if (rooms[room].players.length < rooms[room].maxPlayers) {
-		socket.join(room);
-
-		const { pieces, remaining } = getPiecesToUser(rooms[room].players);
-
-		shuffleArray(pieces);
-
-		rooms[room].remaining = remaining;
-		rooms[room].players.push({ id: socket.id, name, pieces });
-
-		cb(remaining)
-
-		if (!rooms[room].whoStarts && rooms[room].maxPlayers === rooms[room].players.length) {
-			const order = orderPlayers(rooms[room]);
-			rooms[room].order = order;
-
-			order.forEach((_player, idx) => {
-				io.to(_player).emit("ready", { ...getPlayer(rooms[room], _player), initial: idx === 0, players: totalPieces(rooms[room].players, order[0]) });
-			});
-		}
-	} else {
+	if ((roomGame?.game?.players ?? []).length + 1 > roomGame.maxPlayers) {
 		socket.emit("full");
+		return;
 	}
-};
-
-
-
-const handlePlayerDisconnect = ({ roomID, playerID }) => {
-
-	if (!rooms[roomID]) {
-		return "DontExist";
-	}
-
-	const idxPlayer = rooms[roomID].players.findIndex((val) => val.id === playerID);
-
-	if (idxPlayer !== -1) {
-		rooms[roomID].players.forEach((_player) => {
-			io.to(_player.id).emit("gameCancelled", `O jogo foi cancelado pois um saiu da partida.`);
-		})
-		delete rooms[roomID]
-	}
-};
-
-
-const handleraskForPiece = (roomID, playerID) => {
-	const playerIndex = rooms[roomID].players.findIndex(player => player.id === playerID);
-
-
-	if (roomID && playerIndex !== -1) {
-		console.log(rooms[roomID])
-		if (rooms[roomID].moves.length > 0) {
-			const piece = askForPiece(rooms[roomID])
-
-			rooms[roomID].players[playerIndex].pieces.push(piece);
-			return piece
-		} else {
-			return "É necessário ao menos uma peça na mesa para pedir peça."
+	const result = roomGame.addPlayer(socket.id, name);
+	if (!result.ok) {
+		if (result.reason === "full" || result.reason === "game_started") {
+			socket.emit("full");
 		}
-
+		return;
 	}
-	return "Sala não encontrada."
+	socket.join(room);
+	// remaining: 0 = sala cheia / jogo iniciado; >0 = vagas restantes (mostrar "aguardando jogadores")
+	const remaining = roomGame.isStarted()
+		? 0
+		: roomGame.maxPlayers - roomGame.players.length;
+	cb(remaining);
+	if (result.started) {
+		const playerList = roomGame.players;
+		playerList.forEach(({ id: playerSocketId }, idx) => {
+			const isFirst = idx === 0;
+			const hand = roomGame.getHand(playerSocketId) ?? [];
+			const playerInfo = playerList.find((p) => p.id === playerSocketId);
+			io.to(playerSocketId).emit("ready", {
+				id: playerSocketId,
+				name: playerInfo?.name,
+				pieces: hand,
+				initial: isFirst,
+				players: totalPiecesSummary(roomGame, playerSocketId),
+			});
+		});
+	}
 }
 
+function makeMove(socket, roomID, playerID, move, direction) {
+	const roomGame = getRoom(roomID);
+	if (!roomGame) {
+		socket.emit("playerNotFound", "Sala não encontrada.");
+		return;
+	}
+
+	const result = roomGame.makeMove(playerID, move, direction);
+	if (!result.ok) {
+		if (result.reason === "invalid_move") socket.emit("invalidMove");
+		return;
+	}
+
+	const boardTiles = roomGame.getBoardTiles();
+	const whoPlayed = playerID;
+	const nextId = roomGame.getCurrentPlayerId();
+
+	const playerList = roomGame.players;
+	playerList.forEach(({ id }) => {
+		io.to(id).emit("newMove", {
+			players: totalPiecesSummary(roomGame, id),
+			move,
+			direction,
+			whoPlayed,
+			boardTiles,
+		});
+		if (nextId && id === nextId) {
+			io.to(id).emit("nextPlayer");
+		}
+	});
+
+	if (roomGame.isOver()) {
+		const winner = roomGame.getWinner();
+		const playerList = roomGame.players;
+		playerList.forEach(({ id }) => {
+			const isWinner = winner && id === winner.id;
+			const message = isWinner
+				? "Parabéns, você ganhou."
+				: winner
+					? `O jogador ${winner.name} bateu.`
+					: "Jogo fechado - decidido por pontos.";
+			io.to(id).emit("winner", message);
+		});
+	}
+}
+
+function isValidRoom(room, user) {
+	const roomGame = getRoom(room);
+	if (!roomGame) return false;
+	// Se o usuário já está na sala, sempre permitimos (reconexão / refresh)
+	if (user) {
+		const idx = roomGame.players.findIndex((p) => p.id === user);
+		if (idx !== -1) return true;
+	}
+
+	// Para novos jogadores:
+	// - sala com jogo iniciado NÃO está disponível
+	// - sala cheia (players >= maxPlayers) também NÃO está disponível
+	if (roomGame.isStarted()) return false;
+	if (roomGame.players.length >= roomGame.maxPlayers) return false;
+
+	return true;
+}
+
+function handlePlayerDisconnect({ roomID, playerID }) {
+	const roomGame = getRoom(roomID);
+	if (!roomGame) return "DontExist";
+	const idx = roomGame.players.findIndex((p) => p.id === playerID);
+	if (idx === -1) return null;
+	const playerList = roomGame.players;
+	playerList.forEach(({ id }) => {
+		io.to(id).emit(
+			"gameCancelled",
+			"O jogo foi cancelado pois um jogador saiu da partida.",
+		);
+	});
+	delete rooms[roomID];
+	return "DontExist";
+}
+
+function handlerAskForPiece(roomID, playerID) {
+	const roomGame = getRoom(roomID);
+	if (!roomID || !roomGame)
+		return { ok: false, message: "Sala não encontrada." };
+	if (!roomGame.isStarted())
+		return { ok: false, message: "Jogo ainda não iniciou." };
+
+	const result = roomGame.askForPiece(playerID);
+	if (!result.ok) {
+		if (result.reason === "has_playable")
+			return { ok: false, message: "Você tem peça para jogar." };
+		if (result.reason === "pile_empty")
+			return { ok: false, message: "Monte vazio." };
+		if (result.reason === "must_pass")
+			return {
+				ok: false,
+				message: "Você já comprou neste turno; passe a vez.",
+			};
+		if (result.reason === "max_draws_reached")
+			return {
+				ok: false,
+				message: "Limite de compras neste turno atingido; passe a vez.",
+			};
+		return { ok: false, message: result.reason };
+	}
+
+	const hand = roomGame.getHand(playerID);
+	const nextId = result.nextPlayerId ?? roomGame.getCurrentPlayerId();
+	const playerList = roomGame.players;
+	playerList.forEach(({ id }) => {
+		io.to(id).emit("playerDrewPiece", {
+			playerID,
+			players: totalPiecesSummary(roomGame, id),
+			passedTurn: result.passedTurn ?? false,
+		});
+		if (id === playerID) io.to(id).emit("updateHand", hand);
+		if (nextId && id === nextId) io.to(id).emit("nextPlayer");
+	});
+	if (result.passedTurn && roomGame.isOver()) {
+		const winner = roomGame.getWinner();
+		playerList.forEach(({ id }) => {
+			const isWinner = winner && id === winner.id;
+			const message = isWinner
+				? "Parabéns, você ganhou."
+				: winner
+					? `O jogador ${winner.name} bateu.`
+					: "Jogo fechado - decidido por pontos.";
+			io.to(id).emit("winner", message);
+		});
+	}
+
+	return { ok: true, piece: result.tile };
+}
 
 io.sockets.on("connection", (socket) => {
+	socket.on("create", ({ room, maxPlayers }) =>
+		createRoom(socket, { room, maxPlayers }),
+	);
 
-	socket.on("create", ({ room, maxPlayers }) => createRoom(socket, { room, maxPlayers }));
-
-	socket.on("enter", ({ room, name }, cb) => enterRoom(socket, { room, name }, cb));
+	socket.on("enter", ({ room, name }, cb) =>
+		enterRoom(socket, { room, name }, cb),
+	);
 
 	socket.on("verifyRoom", ({ room, user }, cb) => {
-		cb(isValidRoom(room, user))
+		cb(isValidRoom(room, user, socket));
 	});
 
 	socket.on("disconnect-user", ({ roomID, playerID }) => {
-		socket.emit(handlePlayerDisconnect({ roomID, playerID }));
+		const result = handlePlayerDisconnect({ roomID, playerID });
+		if (result) socket.emit(result);
 	});
 
 	socket.on("makeMove", ({ roomID, id, move, direction }) => {
 		makeMove(socket, roomID, id, move, direction);
-
 	});
 
-	socket.on("ashForPiece", ({ roomID, id }, cb) => {
-		cb(handleraskForPiece(roomID, id));
-
+	socket.on("askForPiece", ({ roomID, id }, cb) => {
+		const result = handlerAskForPiece(roomID, id);
+		if (result?.ok) cb(result.piece ?? result);
+		else cb(result?.message ?? "Erro ao pedir peça.");
 	});
 });
 
-server.listen(process.env.PORT || 5000, () => console.log(`Server has started.`));
+server.listen(process.env.PORT || 5001, () =>
+	console.log("Server has started."),
+);
 
 export default io;
